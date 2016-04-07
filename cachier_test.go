@@ -33,14 +33,15 @@ func TestProxy(t *testing.T) {
 	testKey := fmt.Sprintf("%v", rnd.Intn(10000))
 
 	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		time.Sleep(time.Duration(rnd.Intn(1000)))
+		time.Sleep(time.Millisecond * time.Duration(1000+rnd.Intn(1000)))
+		writer.WriteHeader(200)
 		writer.Write([]byte("response=" + request.URL.RequestURI()))
 	}))
 
 	proxy := NewProxy(client, &ProxyOptions{
 		BackendURL:    backend.URL,
 		CookieName:    "foo",
-		StatsInterval: time.Second,
+		StatsInterval: time.Millisecond * 100,
 		RenderTimeout: time.Second * 2,
 		CacheDuration: time.Second * 4,
 		TopicName:     "cachier-test-" + testKey,
@@ -58,44 +59,41 @@ func TestProxy(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(clients)
 
-	failed := 0
-
 	for i := 0; i < clients; i++ {
 		url := fmt.Sprintf("/%v", rnd.Intn(clients>>4))
-		sleep := time.Duration(rnd.Intn(2000))
+		sleep := time.Millisecond * time.Duration(rnd.Intn(2000))
 		go func() {
 			defer wg.Done()
-			time.Sleep(time.Millisecond * sleep)
+			time.Sleep(sleep)
 
-			client := &http.Client{}
+			client := &http.Client{
+				Timeout: time.Second * 5,
+			}
 			request, err := http.NewRequest(http.MethodGet, server.URL+url, bytes.NewBuffer([]byte{}))
 			if err != nil {
 				log.Panic(err)
 			}
 
 			request.AddCookie(&http.Cookie{
-				Name:  "foo",
+				Name:  "foo2",
 				Value: "bar",
 			})
-			res, err := client.Do(request)
+			res, httpErr := client.Do(request)
 
-			// res, err := http.Get(server.URL + url)
-
-			if err == nil {
-				body, err := ioutil.ReadAll(res.Body)
-				if err == nil {
-					assert.Equal(t, "response="+url, fmt.Sprintf("%s", body), "response")
+			if httpErr == nil {
+				body, readErr := ioutil.ReadAll(res.Body)
+				if readErr == nil {
+					assert.Equal(t, "response="+url, string(body), "response")
 				} else {
-					failed++
+					assert.Nil(t, readErr, "read error")
 				}
 			} else {
-				failed++
+				assert.Nil(t, httpErr, "http client error")
 			}
 		}()
 	}
 
-	assert.Equal(t, 0, failed, "no failed requests")
-
 	wg.Wait()
+
 	assert.Empty(t, proxy.GetStats(), "no waiting handlers")
 }

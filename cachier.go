@@ -55,19 +55,19 @@ type Proxy struct {
 
 type proxyListener struct {
 	URL     string
-	Done    chan renderEvent
+	Done    chan *renderEvent
 	Element *list.Element
 }
 
 type renderResult struct {
-	Result []byte `codec:"r,omitempty"`
-	Status int    `codec:"s,omitempty"`
+	Result []byte
+	Status int
 }
 
 type renderEvent struct {
-	URL      string `codec:"u,omitempty"`
-	Location string `codec:"l,omitempty"`
-	Status   int    `codec:"s,omitempty"`
+	URL      string `codec:"u"`
+	Location string `codec:"l"`
+	Status   int    `codec:"s"`
 }
 
 // NewProxy ...
@@ -107,16 +107,18 @@ func NewProxy(redisClient *redis.Client, options *ProxyOptions) *Proxy {
 	}
 
 	proxy := &Proxy{
-		Channels:      make(map[string]*list.List),
-		RedisClient:   redisClient,
-		PubSub:        pubsub,
-		Mutex:         &sync.Mutex{},
-		Options:       options,
-		StatsTicker:   ticker,
-		backendURL:    backendURL,
-		reverse:       httputil.NewSingleHostReverseProxy(backendURL),
-		httpClient:    &http.Client{},
-		encoderHandle: new(codec.JsonHandle),
+		Channels:    make(map[string]*list.List),
+		RedisClient: redisClient,
+		PubSub:      pubsub,
+		Mutex:       &sync.Mutex{},
+		Options:     options,
+		StatsTicker: ticker,
+		backendURL:  backendURL,
+		reverse:     httputil.NewSingleHostReverseProxy(backendURL),
+		httpClient: &http.Client{
+			Timeout: options.RenderTimeout,
+		},
+		encoderHandle: &codec.MsgpackHandle{},
 	}
 
 	if ticker != nil {
@@ -173,7 +175,7 @@ func (proxy Proxy) makeListener(url string) *proxyListener {
 	proxy.lock()
 	defer proxy.unlock()
 
-	channel := make(chan renderEvent)
+	channel := make(chan *renderEvent)
 	old, ok := proxy.Channels[url]
 	var element *list.Element
 	if ok {
@@ -190,7 +192,10 @@ func (proxy Proxy) makeListener(url string) *proxyListener {
 	}
 }
 
-func (proxy Proxy) writeResult(writer http.ResponseWriter, result renderResult) {
+func (proxy Proxy) writeResult(writer http.ResponseWriter, result *renderResult) {
+	if result.Status == 0 {
+		logger.Critical("result status is 0")
+	}
 	if result.Status == 503 {
 		writer.WriteHeader(503)
 		writer.Write([]byte("503"))
@@ -200,8 +205,7 @@ func (proxy Proxy) writeResult(writer http.ResponseWriter, result renderResult) 
 	}
 }
 
-func (proxy Proxy) makeBackendRequest(request *http.Request) renderResult {
-	var result renderResult
+func (proxy Proxy) makeBackendRequest(request *http.Request, result *renderResult) {
 	backendURL := url.URL{
 		Scheme:   proxy.backendURL.Scheme,
 		Host:     proxy.backendURL.Host,
@@ -209,18 +213,16 @@ func (proxy Proxy) makeBackendRequest(request *http.Request) renderResult {
 		RawQuery: request.URL.RawQuery,
 	}
 	response, err := proxy.httpClient.Get(backendURL.String())
+
 	if err != nil {
 		result.Status = 503
 	} else {
 		result.Status = response.StatusCode
-		bytes, err := ioutil.ReadAll(response.Body)
+		result.Result, err = ioutil.ReadAll(response.Body)
 		if err != nil {
 			result.Status = 503
-		} else {
-			result.Result = bytes
 		}
 	}
-	return result
 }
 
 func (proxy Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -231,13 +233,14 @@ func (proxy Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) 
 
 		if !passthrough {
 			if len(proxy.Options.CookieName) != 0 {
-				if _, err := request.Cookie(proxy.Options.CookieName); err != nil {
+				if _, err := request.Cookie(proxy.Options.CookieName); err == nil {
 					passthrough = true
 				}
 			}
 		}
 
 		if passthrough {
+			logger.Debugf("passthrough %s", url)
 			proxy.reverse.ServeHTTP(writer, request)
 			return
 		}
@@ -254,51 +257,52 @@ func (proxy Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) 
 	cachedBytes, err := proxy.RedisClient.Get(valueKey).Bytes()
 
 	if err == nil {
+		logger.Debugf("cached %s", url)
 		proxy.closeListener(listener)
 		codec.NewDecoderBytes(cachedBytes, proxy.encoderHandle).MustDecode(&result)
-
 	} else {
 
 		aquired, err := proxy.RedisClient.SetNX(lockKey, lockVal, proxy.Options.RenderTimeout).Result()
-		proxy.closeListener(listener)
 
 		if err != nil {
 			logger.Panic(err)
 		}
 
 		if aquired {
-			logger.Debugf("render %q", url)
-			result = proxy.makeBackendRequest(request)
+			proxy.closeListener(listener)
+			logger.Debugf("render %s", url)
+			proxy.makeBackendRequest(request, &result)
 
 			buffer := bytes.NewBuffer([]byte{})
 			encoder := codec.NewEncoder(buffer, proxy.encoderHandle)
 			encoder.MustEncode(result)
-			logger.Debugf("res=%v", buffer)
 
-			pipeline := proxy.RedisClient.Pipeline()
 			if result.Status == 200 {
-				pipeline.Set(valueKey, buffer.Bytes(), proxy.Options.CacheDuration)
+				if err := proxy.RedisClient.Set(valueKey, buffer.Bytes(), proxy.Options.CacheDuration).Err(); err != nil {
+					logger.Panic(err)
+				}
 			}
-			pipeline.Del(lockKey)
-			_, err := pipeline.Exec()
 
-			if err != nil {
+			if err := proxy.RedisClient.Del(lockKey).Err(); err != nil {
 				logger.Panic(err)
 			}
 
 			eventBuffer := bytes.NewBuffer([]byte{})
-			codec.NewEncoder(eventBuffer, proxy.encoderHandle).MustEncode(renderEvent{
+			event := renderEvent{
 				URL:    url,
 				Status: result.Status,
-			})
-			logger.Debugf("publish %v", eventBuffer)
+			}
+			codec.NewEncoder(eventBuffer, proxy.encoderHandle).MustEncode(&event)
+			logger.Debugf("render %s done", url)
 			if err := proxy.RedisClient.Publish(proxy.Options.TopicName, eventBuffer.String()).Err(); err != nil {
 				logger.Panic(err)
 			}
 
 		} else {
+			logger.Debugf("wait for %s", url)
 			select {
 			case event := <-listener.Done:
+				logger.Debugf("resolved %s", url)
 				if event.Status == 200 {
 					cachedBytes, err := proxy.RedisClient.Get(valueKey).Bytes()
 					if err != nil {
@@ -306,32 +310,29 @@ func (proxy Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) 
 					}
 					codec.NewDecoderBytes(cachedBytes, proxy.encoderHandle).MustDecode(&result)
 				} else {
-					result = renderResult{
-						Status: event.Status,
-					}
+					result = renderResult{Status: 503}
 				}
 
 			case <-time.After(proxy.Options.RenderTimeout):
-				result = renderResult{
-					Status: 503,
-				}
 				proxy.closeListener(listener)
+				logger.Debugf("timeout %s", url)
+				result = renderResult{Status: 503}
 			}
 		}
 	}
 
-	proxy.writeResult(writer, result)
+	proxy.writeResult(writer, &result)
 }
 
-func (proxy Proxy) handleRenderMessage(event renderEvent) {
+func (proxy Proxy) handleRenderMessage(event *renderEvent) {
 	proxy.lock()
 	defer proxy.unlock()
 
 	channels, ok := proxy.Channels[event.URL]
 	if ok {
-		logger.Debugf("%q ready", event.URL)
+		logger.Debugf("%s ready", event.URL)
 		for e := channels.Front(); e != nil; e = e.Next() {
-			channel := e.Value.(chan renderEvent)
+			channel := e.Value.(chan *renderEvent)
 			channel <- event
 			close(channel)
 		}
@@ -358,7 +359,7 @@ func (proxy Proxy) readRenderEvents() {
 		}
 		var event renderEvent
 		codec.NewDecoderBytes([]byte(msg.Payload), proxy.encoderHandle).MustDecode(&event)
-		proxy.handleRenderMessage(event)
+		proxy.handleRenderMessage(&event)
 	}
 }
 
@@ -370,29 +371,31 @@ func main() {
 	var bind string
 	var statsInterval int64
 	var logLevel string
+	var cacheDuration int64
+	var renderTimeout int64
 
 	flag.StringVar(&backendURL, "backendURL", "http://127.0.0.1:3000", "backend url")
 	flag.StringVar(&redisHost, "redisHost", "127.0.0.1", "redis host")
 	flag.IntVar(&redisPort, "redisPort", 6379, "redis port")
 	flag.Int64Var(&redisDB, "redisDB", 0, "redis database to use (default 0)")
 	flag.StringVar(&bind, "bind", ":8080", "host:port or :port to listen")
+	flag.Int64Var(&cacheDuration, "cacheDuration", 5000, "cache duration, ms")
+	flag.Int64Var(&renderTimeout, "renderTimeout", 5000, "render timeout, ms")
 	flag.Int64Var(&statsInterval, "statsInterval", 0, "dump stats interval, ms (default disabled)")
-	flag.StringVar(&logLevel, "logLevel", "WARNING", "log level (DEBUG, INFO, WARNING, CRITICAL)")
+	flag.StringVar(&logLevel, "logLevel", "WARNING", "log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)")
 	flag.Parse()
 
 	logBackend := logging.NewBackendFormatter(logging.NewLogBackend(os.Stderr, "", 0), format)
 	leveled := logging.AddModuleLevel(logBackend)
-	leveled.SetLevel(logging.CRITICAL, "cachier")
-	if logLevel == "DEBUG" {
-		leveled.SetLevel(logging.DEBUG, "cachier")
-	} else if logLevel == "INFO" {
-		leveled.SetLevel(logging.INFO, "cachier")
-	} else if logLevel == "WARNING" {
-		leveled.SetLevel(logging.WARNING, "cachier")
-	} else if logLevel == "CRITICAL" {
-		leveled.SetLevel(logging.CRITICAL, "cachier")
+
+	levels := map[string]logging.Level{
+		"DEBUG":    logging.DEBUG,
+		"INFO":     logging.INFO,
+		"WARNING":  logging.WARNING,
+		"ERROR":    logging.ERROR,
+		"CRITICAL": logging.CRITICAL,
 	}
-	logger.SetBackend(leveled)
+	leveled.SetLevel(levels[logLevel], "cachier")
 
 	client := redis.NewClient(&redis.Options{
 		Addr: fmt.Sprintf("%v:%v", redisHost, redisPort),
@@ -405,6 +408,8 @@ func main() {
 
 	proxy := NewProxy(client, &ProxyOptions{
 		BackendURL:    backendURL,
+		CacheDuration: time.Duration(cacheDuration) * time.Millisecond,
+		RenderTimeout: time.Duration(renderTimeout) * time.Millisecond,
 		StatsInterval: time.Duration(statsInterval) * time.Millisecond,
 	})
 
