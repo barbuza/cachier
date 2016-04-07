@@ -54,7 +54,7 @@ func TestProxy(t *testing.T) {
 	defer server.Close()
 	defer backend.Close()
 
-	clients := 4000
+	clients := 400
 	var wg sync.WaitGroup
 	wg.Add(clients)
 
